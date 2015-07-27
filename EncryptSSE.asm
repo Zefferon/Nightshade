@@ -1,0 +1,807 @@
+;***********************************************************************************************;
+;***********************     SHALLIZAR.COM  >>>  THE NASM COLLECTION     ***********************;
+;***********************************************************************************************;
+;>>>>> EncryptSSE.asm		<LIBRARY MODULE>
+;################################################################;
+;		THE SHALLIZAR LINUX RUNTIME			#;
+;################################################################;
+;========================================;
+;=	Encryption LIBRARY		=;
+;========================================;
+;
+;############	LICENSE   #############
+;PROGARM: EncryptSSE.asm ; TYPE: LIBRARY MODULE ; PURPOSE: ENCRYPT & DECRYPT FILES USING SSE
+;	Copyright (C) 2015 Shallizar.com
+;
+;This program is free software: you can redistribute it and/or modify
+;it under the terms of the GNU General Public License as published by
+;the Free Software Foundation, either version 3 of the License, or
+;(at your option) any later version.
+;
+;This program is distributed in the hope that it will be useful,
+;but WITHOUT ANY WARRANTY; without even the implied warranty of
+;MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+;GNU General Public License for more details.
+;
+;You should have received a copy of the GNU General Public License
+;along with this program.  If not, see <http://www.gnu.org/licenses/>.
+;
+;
+; EncryptSSE.asm
+; 1.00
+;
+;
+; DEVELOPMENT ENVIRONMENT:
+;	***** NASM *****
+;
+; PLATFORM: generic pentium 6
+;           openSUSE : KDE : Kate, Kdebug
+;
+;
+; ASSEMBLE:
+;	nasm -f elf EncryptSSE.asm -l EncryptSSE.lst
+;
+; LIBRARY:
+;	ar rcs Encryption.lib EncryptSSE.o
+;
+; MAKE:
+;	make -f Encryption.make
+;
+;DEPENDENCIES:
+; none
+;
+;
+;
+;PUBLIC FUNCTIONS
+; EncryptSSEInit:   - INITIALIZE BUFFER POINTERS
+
+SECTION .bss
+alignb 4
+;BUFFERS
+	TEXTBUFFER	resb 1048608	;1 MEGABYTE + 16 BYTE MIS-ALIGN + 16 BYTE OVERRUN
+	PADBUFFER	resb 1048608
+	TEXTSTART	resd 1
+	PADSTART	resd 1
+;COUNTERS
+	SOURCE_CNT	resq 1	;TOTAL # OF BYTES OF SOURCE
+	PAD_CNT		resq 1	;TOTAL # OF BYTES OF PAD
+	TARGET_CNT	resq 1	;TOTAL # OF BYTES OF TARGET
+	READ_CNT	resd 1	;# OF BYTES TO READ FROM SOURCE
+	CHOP_CNT	resd 1	;LOOP COUNTER FOR CHOPPER
+	CHOP_REM_M	resd 1	;CHOPPER REMAINING MEG COUNT
+	CHOP_REM_R	resd 1	;CHOPPER REMAINING COUNT
+	CHOP_REST	resd 1	;CHOPPER COUNT FOR REMAINING BYTES = REMAINDER / 16
+	cnt0		resd 1	;# OF BYTES TO READ ON MEGABYTE FILLS
+	cnt1		resd 1	;# OF BYTES TO READ ON PARTIAL FILLS
+	RipCnt		resd 1	;REMAINDER COUNT
+;POINTERS
+	PAD_PTR		resd 1	;CURRENT POSITION OF NEXT READ INTO PAD BUFFER
+
+;FILES
+	SOURCE_FILE		resd 1	;PTR TO ASCII-Z STRING OF SOURCE FILE NAME
+	SOURCE_FILE_SIZE	resq 2	;SIZE OF SOURCE FILE - 64-BIT INT
+	SOURCE_HANDLE		resd 1	;FILE HANDLE RETURNED BY SYSTEM OPEN
+	S_Mcnt			resd 1	;# OF MEGS OF SOURCE FILE
+	S_Rcnt			resd 1	;# OF REMAINING BYTES OF SOURCE FILE
+	SRipCnt			resd 1	;RIP COUNT FOR REMAINING BYTES OF SOURCE FILE
+
+	PAD_FILE		resd 1	;PTR TO ASCII-Z STRING OF PAD FILE NAME
+	PAD_FILE_SIZE		resq 2	;SIZE OF PAD FILE - 64-BIT INT
+	PAD_HANDLE		resd 1	;FILE HANDLE RETURNED BY SYSTEM OPEN
+	P_Mcnt			resd 1	;# OF MEGS OF PAD FILE
+	P_Rcnt			resd 1	;# OF REMAINING BYTES OF PAD FILE
+	PRipCnt			resd 1	;RIP COUNT FOR REMAINING BYTES OF PAD
+
+	ENCRYPT_FILE		resd 1	;PTR TO ASCII-Z STRING OF ENCRYPTED FILE NAME
+	ENCRYPT_FILE_SIZE	resq 2	;SIZE OF ENCRYPTED FILE - 64-BIT INT
+	ENCRYPT_HANDLE		resd 1	;FILE HANDLE RETURNED BY SYSTEM OPEN
+
+	SAVE_EBP	resd 1
+
+;PROGRESS CALLBAK
+	ProgessCnt	resd 1
+
+SECTION .data
+;LINUX CONSTANTS
+%define SysOpen		5	;__NR_open
+%define SysRead		3	;__NR_read
+%define SysWrite	4	;__NR_write
+%define SysClose	6	;__NR_close
+%define SysSeek		19	;__NR_lseek
+%define ReadOnly	0	;O_RDONLY
+%define WriteOnly	1	;O_WRONLY
+%define ReadWrite	2	;O_RDWR
+%define CreateNew	100q	;O_CREAT
+%define OpenLarge	100000q	;O_LARGEFILE
+%define PERMISSION_OWNER_READ	400q
+%define PERMISSION_OWNER_WRITE	200q
+%define SeekFromBeginning	0
+%define StdOut		1
+
+align 4
+;CONSTANTS
+;	Gig	dd 1073741824	;A GIGABYTE
+	Meg	dq 1048576	;2 PACKED MEGABYTE QUAD WORDS
+		dq 1048576
+	one	dd 1
+	sixteen	dd 16
+
+	LineReturn	dd 13	;CARRIAGE RETURN FOR StdOut
+
+;FPU CONTROL WORD
+	FPU_CTRL	dw 0000_11_11_01_111111b, 0	;ROUND: TRUNCATE
+							;PRECISION: 64 BITS
+							;BIT 6: ? - IS SET BY FNINIT
+							;EXCEPTIONS: MASK ALL
+
+;ERRORS
+	ERROR_CODE	dd 0
+
+;ERROR MESSAGES
+	ERROR_PTR		dd ERRMSG_NONE
+	ERRMSG_NONE		db "no_error", 0
+	ERRMSG_STAT_SOURCE	db "EncryptSSE: ERROR STATTING SOURCE FILE: ", 0
+	ERRMSG_STAT_PAD		db "EncryptSSE: ERROR STATTING PAD FILE: ", 0
+	ERRMSG_OPEN_SOURCE	db "EncryptSSE: ERROR OPENING SOURCE FILE: ", 0
+	ERRMSG_OPEN_PAD		db "EncryptSSE: ERROR OPENING PAD FILE: ", 0
+	ERRMSG_OPEN_TARGET	db "EncryptSSE: ERROR OPENING ENCRYPTED FILE: ", 0
+	ERRMSG_SEEK_PAD		db "EncryptSSE: ERROR SEEKING PAD FILE", 0
+	ERRMSG_READ_PAD		db "EncryptSSE: ERROR READING PAD FILE", 0
+	ERRMSG_READ_SOURCE	db "EncryptSSE: ERROR READING SOURCE FILE", 0
+	ERRMSG_WRITE_TARGET	db "EncryptSSE: ERROR WRITING OUTPUT FILE", 0
+align 4
+	DESC_PTR		dd ERRDESC_NONE
+	ERRDESC_NONE		db "---", 0
+	ERRDESC_NOT_FOUND	db "FILE NOT FOUND", 0
+	ERRDESC_DENY		db "PERMISSION DENIED", 0
+	ERRDESC_OTHER		db "OTHER ERROR", 0
+
+;PROGRESS DUMMY FUNCTION
+align 4
+	Progress	dd PROGRESS_DUMMY
+
+
+;========================================================================;
+;=				PROCEDURES				=;
+;========================================================================;
+SECTION .text
+
+;MACROS
+;	MOVMEM		MOVE DWORD TO DWORD
+%macro	MOVMEM 2
+	MOV	EAX, %2
+	MOV	%1, EAX
+%endmacro
+
+;	LOAD_SRC_1M		LOAD SOURCE 1 MEGABYTE
+%macro	LOAD_SRC_1M 0
+	MOV	EAX, SysRead
+	MOV	EBX, [SOURCE_HANDLE]
+	MOV	ECX, [TEXTSTART]
+	MOV	EDX, 1048576
+	INT	80h
+	BT	EAX, 31
+	JC	ERR_READ_SOURCE
+%endmacro
+;	LOAD_PAD_1M		LOAD PAD 1 MEGABYTE
+%macro	LOAD_PAD_1M 0
+	MOV	EAX, SysRead
+	MOV	EBX, [PAD_HANDLE]
+	MOV	ECX, [PADSTART]
+	MOV	EDX, 1048576
+	INT	80h
+	BT	EAX, 31
+	JC	ERR_READ_PAD
+%endmacro
+;	RIP_1M		ENCRYPT 1 MEGABYTE
+%macro	RIP_1M 0
+	MOV	ESI, [TEXTSTART]
+	MOV	EDI, [PADSTART]
+	XOR	EAX, EAX
+	MOV	ECX, 65536
+.RIP:
+	MOVAPS	XMM0, [ESI+EAX]
+	XORPS	XMM0, [EDI+EAX]
+	MOVAPS	[ESI+EAX], XMM0
+	LEA	EAX, [EAX+16]
+	LOOP	.RIP
+%endmacro
+;	WRITE_1M		WRITE 1 MEG TO ENCRYPTED FILE
+%macro	WRITE_1M 0
+	MOV	EAX, SysWrite
+	MOV	EBX, [ENCRYPT_HANDLE]
+	MOV	ECX, [TEXTSTART]
+	MOV	EDX, 1048576
+	INT	80h
+	BT	EAX, 31
+	JC	ERR_WRITE_TARGET
+%endmacro
+
+;	LOAD_SRC_P		LOAD SOURCE PARTIAL
+%macro	LOAD_SRC_P 0
+	MOV	EAX, SysRead
+	MOV	EBX, [SOURCE_HANDLE]
+	MOV	ECX, [TEXTSTART]
+	MOV	EDX, [cnt1]
+	INT	80h
+	BT	EAX, 31
+	JC	ERR_READ_SOURCE
+%endmacro
+;	LOAD_PAD_P		LOAD PAD PARTIAL
+%macro	LOAD_PAD_P 0
+	MOV	EAX, SysRead
+	MOV	EBX, [PAD_HANDLE]
+	MOV	ECX, [PADSTART]
+	MOV	EDX, [cnt1]
+	INT	80h
+	BT	EAX, 31
+	JC	ERR_READ_PAD
+%endmacro
+;	RIP_P		ENCRYPT PARTIAL
+%macro	RIP_P 0
+	MOV	ESI, [TEXTSTART]
+	MOV	EDI, [PADSTART]
+	XOR	EAX, EAX
+	MOV	ECX, [RipCnt]
+.RIP:
+	MOVAPS	XMM0, [ESI+EAX]
+	XORPS	XMM0, [EDI+EAX]
+	MOVAPS	[ESI+EAX], XMM0
+	LEA	EAX, [EAX+16]
+	LOOP	.RIP
+%endmacro
+;	WRITE_P		WRITE PARTIAL # OF BYTES TO ENCRYPTED FILE
+%macro	WRITE_P 0
+	MOV	EAX, SysWrite
+	MOV	EBX, [ENCRYPT_HANDLE]
+	MOV	ECX, [TEXTSTART]
+	MOV	EDX, [cnt1]
+	INT	80h
+	BT	EAX, 31
+	JC	ERR_WRITE_TARGET
+%endmacro
+
+;	LINE_RETURN
+%macro	LINE_RETURN 0
+	MOV	EAX, SysWrite
+	MOV	EBX, StdOut
+	MOV	ECX, [LineReturn]
+	MOV	EDX, 1
+	INT	80h
+%endmacro
+
+;EXTERNAL PROCEDURES
+; FileSystem
+	extern	FileSystem.FileStat
+
+;LOCAL PROCEDURES
+EncryptSSEInit:
+;ADJUST POINTERS TO BUFFERS TO 16-BYTE PAGE BOUNDARYS
+;
+;CALLER:
+; NOTHING
+;
+	MOV	EAX, TEXTBUFFER+16
+	AND	EAX, 0FFFFFFF0h
+	MOV	[TEXTSTART], EAX
+	MOV	EAX, PADBUFFER+16
+	AND	EAX, 0FFFFFFF0h
+	MOV	[PADSTART], EAX
+;CLEAR ERROR
+	MOV	dword [ERROR_CODE], 0
+	MOV	dword [ERROR_PTR], ERRMSG_NONE
+	MOV	dword [DESC_PTR], ERRDESC_NONE
+	MOV	dword [ProgessCnt], 0
+	RET
+
+
+;GLOBAL PROCEDURES
+;****************************************************************;
+;*			ENCRYPT FILE				*;
+;****************************************************************;
+	global	EncryptSSE.EncryptFile
+EncryptSSE.EncryptFile:
+	MOV	[SOURCE_FILE], EBX
+	MOV	[PAD_FILE], ECX
+	MOV	[ENCRYPT_FILE], EDX
+
+	CALL	EncryptSSEInit
+
+;STAT SOURCE
+	MOV	EBX, [SOURCE_FILE]
+	XOR	EDX, EDX
+	CALL	FileSystem.FileStat
+	JC	ERR_STAT_SOURCE
+	MOV	[SOURCE_FILE_SIZE], EAX
+	MOV	[SOURCE_FILE_SIZE+4], EDX
+
+;STAT PAD
+	MOV	EBX, [PAD_FILE]
+	XOR	EDX, EDX
+	CALL	FileSystem.FileStat
+	JC	ERR_STAT_PAD
+	MOV	[PAD_FILE_SIZE], EAX
+	MOV	[PAD_FILE_SIZE+4], EDX
+
+
+
+;OPEN SOURCE
+	MOV	EAX, SysOpen
+	MOV	EBX, [SOURCE_FILE]
+	MOV	ECX, ReadOnly + OpenLarge
+	MOV	EDX, PERMISSION_OWNER_READ
+	INT	80h
+	BT	EAX, 31
+	JC	ERR_OPEN_SOURCE
+	MOV	[SOURCE_HANDLE], EAX
+
+;OPEN PAD
+	MOV	EAX, SysOpen
+	MOV	EBX, [PAD_FILE]
+	MOV	ECX, ReadOnly + OpenLarge
+	MOV	EDX, PERMISSION_OWNER_READ
+	INT	80h
+	BT	EAX, 31
+	JC	ERR_OPEN_PAD
+	MOV	[PAD_HANDLE], EAX
+
+;OPEN TARGET
+	MOV	EAX, SysOpen
+	MOV	EBX, [ENCRYPT_FILE]
+	MOV	ECX, ReadWrite + OpenLarge + CreateNew
+	MOV	EDX, PERMISSION_OWNER_READ + PERMISSION_OWNER_WRITE
+	INT	80h
+	BT	EAX, 31
+	JC	ERR_OPEN_TARGET
+	MOV	[ENCRYPT_HANDLE], EAX
+
+;CALCULATE LOOP VALUES
+	FNINIT
+	FLDCW	[FPU_CTRL]	;SET ROUNDING TO TRUNCATE
+	FLD1
+	FILD	dword [sixteen]
+	FILD	dword [Meg]
+;SOURCE FILE LOOP VALUES
+	FILD	qword [SOURCE_FILE_SIZE]
+	FLD	ST0
+	FDIV	ST0, ST2
+	FISTP	dword [S_Mcnt]
+	FPREM1
+	FTST			;IS REMAINDER NEGATIVE?
+	FSTSW	AX
+	TEST	AH, 1
+	JZ	POSITIVE_REMAINDER
+	FADD	ST0, ST1
+POSITIVE_REMAINDER:
+	FIST	dword [S_Rcnt]
+	FDIV	ST0, ST2
+	FADD	ST0, ST3
+	FISTP	dword [SRipCnt]
+
+;PAD FILE LOOP VALUES
+	FILD	qword [PAD_FILE_SIZE]
+	FLD	ST0
+	FDIV	ST0, ST2
+	FISTP	dword [P_Mcnt]
+	FPREM1
+	FTST			;IS REMAINDER NEGATIVE?
+	FSTSW	AX
+	TEST	AH, 1
+	JZ	POSITIVE_REMAINDER2
+	FADD	ST0, ST1
+POSITIVE_REMAINDER2:
+	FIST	dword [P_Rcnt]
+	FDIV	ST0, ST2
+	FADD	ST0, ST3
+	FISTP	dword [PRipCnt]
+
+
+;IF PAD SIZE > 1 MEG, USE CHOPPER, IF = 1 MEG, USE BLITZER
+	CMP	dword [P_Mcnt], 1
+	JG	CHOPPER
+	JL	SMALL_PAD
+	CMP	dword [P_Rcnt], 0
+	JG	CHOPPER
+;CHEK_P_Rcnt:
+	LOAD_PAD_1M
+	JMP	BLITZER
+
+;USE PAD < 1 MEG
+SMALL_PAD:
+	MOV	EDX, [P_Rcnt]
+	MOV	EAX, SysRead
+	MOV	EBX, [PAD_HANDLE]
+	MOV	ECX, [PADSTART]
+	MOV	[PAD_PTR], ECX
+	INT	80h
+	BT	EAX, 31
+	JC	ERR_READ_PAD
+	MOV	EBP, [P_Rcnt]
+	ADD	[PAD_PTR], EBP
+;CALC # OF CHUNK COPIES
+	MOV	EAX, 1048576
+	XOR	EDX, EDX
+	DIV	EBP
+	MOV	[cnt0], EDX	;SAVE REMAINDER
+	SUB	EAX, 1
+	JBE	SKIP_CHUNKS
+	MOV	EDX, EBP
+	SHR	EDX, 2
+	INC	EDX
+COPY_PAD_CHUNK:
+	MOV	ESI, [PADSTART]
+	MOV	EDI, [PAD_PTR]
+	MOV	ECX, EDX
+	REP	MOVSD
+	ADD	[PAD_PTR], EBP
+	DEC	EAX
+	JNZ	COPY_PAD_CHUNK
+SKIP_CHUNKS:
+	MOV	ESI, [PADSTART]
+	MOV	EDI, [PAD_PTR]
+	MOV	ECX, [cnt0]
+	SHR	ECX, 2
+	INC	ECX
+	REP	MOVSD
+
+	JMP	BLITZER
+
+
+
+;********************************************************;
+;			CHOPPER				*;
+;********************************************************;
+CHOPPER:
+	FILD	qword [PAD_FILE_SIZE]
+	FILD	qword [SOURCE_FILE_SIZE]
+	FLD	ST0
+	FDIV	ST0, ST2
+	FISTP	dword [CHOP_CNT]
+	FPREM1
+	FTST			;IS REMAINDER NEGATIVE?
+	FSTSW	AX
+	TEST	AH, 1
+	JZ	.POS
+	FADD	ST0, ST1
+.POS:
+	FXCH
+	FISTP	dword [CHOP_REM_M]	;THROW-AWAY
+	FLD	ST0
+	FDIV	ST0, ST2
+	FISTP	dword [CHOP_REM_M]
+	FPREM1
+	FTST			;IS REMAINDER NEGATIVE?
+	FSTSW	AX
+	TEST	AH, 1
+	JZ	.POS2
+	FADD	ST0, ST1
+.POS2:
+	FIST	dword [CHOP_REM_R]
+	FISTP	dword [CHOP_REST]
+	SHR	dword [CHOP_REST], 4
+	INC	dword [CHOP_REST]
+
+CHOP_QUOTIENT:
+	BSF	EAX, [CHOP_CNT]
+	JZ	CHOP_REM
+	MOVQ	MM0, [P_Mcnt]
+	MOVMEM	[RipCnt], [PRipCnt]
+	CALL	CHUNK
+CHOP_REM:
+	MOV	dword [CHOP_CNT], 1	;CHUNK WILL RUN ONCE
+	MOVQ	MM0, [CHOP_REM_M]
+	MOVMEM	[RipCnt], [CHOP_REST]
+	CALL	CHUNK
+	JMP	FINISH	
+
+CHUNK:
+;SEEK BEGINNING OF PAD FILE
+	MOV	EAX, SysSeek
+	MOV	EBX, [PAD_HANDLE]
+	MOV	ECX, 0
+	MOV	EDX, SeekFromBeginning
+	INT	80h
+	BT	EAX, 31
+	JC	ERR_SEEK_PAD
+;TEST MEG COUNT
+	MOVQ	[cnt0], MM0	;MOV PAD MEG COUNT INTO cnt0
+	BSF	EAX, [cnt0]
+	JZ	CHUNK_REM
+
+	REFILL_TEXT:
+		LOAD_SRC_1M
+	;REFILL_PAD
+		LOAD_PAD_1M
+	;ENCRYPT
+		RIP_1M
+	;STORE
+		WRITE_1M
+	;PROGRESS
+		INC	dword [ProgessCnt]
+		PUSH	dword [S_Mcnt]
+		PUSH	dword [ProgessCnt]
+		CALL	[Progress]
+		ADD	ESP, 8
+;LOOP
+	DEC	dword [cnt0]
+	JNZ	REFILL_TEXT
+CHUNK_REM:
+	BSF	EAX, [cnt1]
+	JZ	CHUNK_LOOP
+;REFILL_TEXT
+	LOAD_SRC_P
+;REFILL_PAD
+	LOAD_PAD_P
+;ENCRYPT
+;	RIP_P
+	MOV	ESI, [TEXTSTART]
+	MOV	EDI, [PADSTART]
+	XOR	EAX, EAX
+	MOV	ECX, [RipCnt]
+.RIP:
+	MOVAPS	XMM0, [ESI+EAX]
+	XORPS	XMM0, [EDI+EAX]
+	MOVAPS	[ESI+EAX], XMM0
+	LEA	EAX, [EAX+16]
+	LOOP	.RIP
+;STORE
+	WRITE_P
+CHUNK_LOOP:
+	DEC	dword [CHOP_CNT]
+	JNZ	CHUNK
+	RET
+
+
+
+;********************************************************;
+;			BLITZER				*;
+;********************************************************;
+BLITZER:
+;ENCRYPT SOURCE FILE WITH EXACT 1 MEGABYTE PAD
+	BSF	EAX, [S_Mcnt]
+	JZ	REM
+	MOVMEM	[cnt0], [S_Mcnt]
+	.NEXT:
+		LOAD_SRC_1M
+		RIP_1M	
+		WRITE_1M	
+	;PROGRESS
+		INC	dword [ProgessCnt]
+		PUSH	dword [S_Mcnt]
+		PUSH	dword [ProgessCnt]
+		CALL	[Progress]
+		ADD	ESP, 8
+		DEC	dword [cnt0]
+		JNZ	.NEXT
+REM:
+	BSF	EAX, [S_Rcnt]
+	JZ	FINISH
+	MOVMEM	[cnt1], [S_Rcnt]
+	MOVMEM	[RipCnt], [SRipCnt]
+
+	LOAD_SRC_P
+	RIP_P
+	WRITE_P
+
+FINISH:
+	CALL	CLOSE_ALL
+	MOV	EAX, [SOURCE_FILE_SIZE]
+	MOV	EDX, [SOURCE_FILE_SIZE+4]
+	MOV	EBX, ERRMSG_NONE
+	EMMS
+	CLC
+	RET
+
+
+
+;********************************************************;
+;			ERRORS				*;
+;********************************************************;
+ERR_STAT_SOURCE:
+	MOV	[ERROR_CODE], EAX
+	MOV	EBX, ERRDESC_NOT_FOUND
+	MOV	ECX, ERRDESC_DENY
+	MOV	EDX, ERRDESC_OTHER
+	CMP	EAX, -13
+	CMOVE	EBX, ECX
+	CMP	EAX, -2
+	CMOVNE	EBX, EDX	
+	MOV	[DESC_PTR], EBX
+	MOV	EBX, ERRMSG_STAT_SOURCE
+	RET
+
+ERR_STAT_PAD:
+	MOV	[ERROR_CODE], EAX
+	MOV	EBX, ERRDESC_NOT_FOUND
+	MOV	ECX, ERRDESC_DENY
+	MOV	EDX, ERRDESC_OTHER
+	CMP	EAX, -13
+	CMOVE	EBX, ECX
+	CMP	EAX, -2
+	CMOVNE	EBX, EDX	
+	MOV	[DESC_PTR], EBX
+	MOV	EBX, ERRMSG_STAT_PAD
+	RET
+
+ERR_OPEN_SOURCE:
+	MOV	[ERROR_CODE], EAX
+	MOV	EBX, ERRDESC_NOT_FOUND
+	MOV	ECX, ERRDESC_DENY
+	MOV	EDX, ERRDESC_OTHER
+	CMP	EAX, -13
+	CMOVE	EBX, ECX
+	CMP	EAX, -2
+	CMOVNE	EBX, EDX	
+	MOV	[DESC_PTR], EBX
+	MOV	EBX, ERRMSG_OPEN_SOURCE
+	RET
+
+ERR_OPEN_PAD:
+	MOV	[ERROR_CODE], EAX
+	MOV	EBX, ERRDESC_NOT_FOUND
+	MOV	ECX, ERRDESC_DENY
+	MOV	EDX, ERRDESC_OTHER
+	CMP	EAX, -13
+	CMOVE	EBX, ECX
+	CMP	EAX, -2
+	CMOVNE	EBX, EDX	
+	MOV	[DESC_PTR], EBX
+	MOV	EAX, SysClose
+	MOV	EBX, [SOURCE_HANDLE]
+	INT	80h
+	MOV	EBX, ERRMSG_OPEN_PAD
+	RET
+
+ERR_OPEN_TARGET:
+	MOV	[ERROR_CODE], EAX
+	MOV	EBX, ERRDESC_NOT_FOUND
+	MOV	ECX, ERRDESC_DENY
+	MOV	EDX, ERRDESC_OTHER
+	CMP	EAX, -13
+	CMOVE	EBX, ECX
+	CMP	EAX, -2
+	CMOVNE	EBX, EDX	
+	MOV	[DESC_PTR], EBX
+	MOV	EAX, SysClose
+	MOV	EBX, [SOURCE_HANDLE]
+	INT	80h
+	MOV	EAX, SysClose
+	MOV	EBX, [PAD_HANDLE]
+	INT	80h
+	MOV	EBX, ERRMSG_OPEN_TARGET
+	RET
+
+ERR_SEEK_PAD:
+	MOV	[ERROR_CODE], EAX
+	CALL	CLOSE_ALL
+	MOV	EAX, [ERROR_CODE]
+	MOV	EBX, ERRMSG_SEEK_PAD
+	STC
+	RET
+
+ERR_READ_PAD:
+	MOV	[ERROR_CODE], EAX
+	CALL	CLOSE_ALL
+	MOV	EAX, [ERROR_CODE]
+	MOV	EBX, ERRMSG_READ_PAD
+	STC
+	RET
+
+ERR_READ_SOURCE:
+	MOV	[ERROR_CODE], EAX
+	POP	EAX
+	CALL	CLOSE_ALL
+	MOV	EAX, [ERROR_CODE]
+	MOV	EBX, ERRMSG_READ_SOURCE
+	STC
+	RET
+
+ERR_WRITE_TARGET:
+	MOV	[ERROR_CODE], EAX
+	POP	EAX
+	CALL	CLOSE_ALL
+	MOV	EAX, [ERROR_CODE]
+	MOV	EBX, ERRMSG_WRITE_TARGET
+	STC
+	RET
+
+;READ SOURCE, XOR, WRITE TARGET
+ENCRYPT_BUFFER:
+	MOV	EAX, SysRead
+	MOV	EBX, [SOURCE_HANDLE]
+	MOV	ECX, [TEXTSTART]
+	MOV	EDX, [READ_CNT]
+	INT	80h
+	BT	EAX, 31
+	JC	ERR_READ_SOURCE
+
+CLOSE_ALL:
+	MOV	EAX, SysClose
+	MOV	EBX, [SOURCE_HANDLE]
+	INT	80h
+	MOV	EAX, SysClose
+	MOV	EBX, [PAD_HANDLE]
+	INT	80h
+	MOV	EAX, SysClose
+	MOV	EBX, [ENCRYPT_HANDLE]
+	INT	80h
+	RET
+
+
+
+;************************************************;
+;*						*;
+;*		C ENTRY POINTS			*;
+;*						*;
+;************************************************;
+;
+;	FUNCTION WRAPPERS FOR C PROGRAMS
+;
+
+;EncryptFile
+; DECLARE:
+;	extern int _EncryptSSE_EncryptFile(const char *Src, const char *Pad, const char *Crypt );
+; USAGE:
+;	ReturnCode = _EncryptSSE_EncryptFile( Sourcefile, Padfile, Encryptedfile );
+;
+;CALLER:
+; [ESP+12]: EncryptedFile
+; [ESP+8]:  PadFile
+; [ESP+4]:  SouceFile
+;
+	global	_EncryptSSE_EncryptFile
+_EncryptSSE_EncryptFile:
+	MOV	[SAVE_EBP], EBP
+
+	MOV	EBX, [ESP+4]
+	MOV	ECX, [ESP+8]
+	MOV	EDX, [ESP+12]
+	CALL	EncryptSSE.EncryptFile
+
+	MOV	[ERROR_PTR], EBX
+	MOVSX	EAX, byte [ERROR_CODE+3]
+	MOV	EBP, [SAVE_EBP]
+	RET
+
+
+;****************************************;
+;*		CALLBAKS		*;
+;****************************************;
+;SetCallbak
+; DECLARE:
+;	extern int _EncryptSSE_SetCallbak(const char *Src, const char *Pad, const char *Crypt );
+; USAGE:
+;	ReturnCode = _EncryptSSE_SetCallbak( Sourcefile, Padfile, Encryptedfile );
+;
+;CALLER:
+; [ESP+4]: PTR TO Callbak FUNCTION
+;
+	global	_EncryptSSE_SetCallbak
+_EncryptSSE_SetCallbak:
+	MOV	EAX, [ESP+4]
+	MOV	[Progress], EAX
+	RET
+
+
+;PROGRESS DUMMY FUNCTION
+PROGRESS_DUMMY:
+	RET
+
+
+;****************************************;
+;*		PROPERTIES		*;
+;****************************************;
+	global	_EncryptSSE_PropErrMsg
+_EncryptSSE_PropErrMsg:
+	MOV	EAX, [ERROR_PTR]
+	RET
+
+	global	_EncryptSSE_PropErrCode
+_EncryptSSE_PropErrCode:
+	MOV	EAX, [ERROR_CODE]
+	RET
+
+	global	_EncryptSSE_PropErrDesc
+_EncryptSSE_PropErrDesc:
+	MOV	EAX, [DESC_PTR]
+	RET
